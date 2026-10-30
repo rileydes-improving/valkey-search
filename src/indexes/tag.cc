@@ -6,6 +6,7 @@
 
 #include "src/indexes/tag.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -16,6 +17,7 @@
 
 #include "absl/base/optimization.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/hash/hash.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/ascii.h"
@@ -60,14 +62,38 @@ bool RejectNonUtf8(absl::string_view data) {
   return false;
 }
 
-// Treats ASCII case variants as one tag without lowercase copies.
-struct AsciiFoldHash {
-  size_t operator()(absl::string_view s) const {
-    uint64_t h = 14695981039346656037ULL;  // FNV-1a
-    for (unsigned char c : s) {
-      h = (h ^ absl::ascii_tolower(c)) * 1099511628211ULL;
+// Treats ASCII case variants as one tag without materializing lowercase
+// copies. Hashing routes the folded bytes through abseil's seeded, avalanching
+// hash state (fixed-size stack-buffer chunks fed to combine_contiguous), not a
+// bare FNV-1a. FNV-1a has no finalizer, so its low k bits are a linear function
+// of the input's low k bits; an attacker could mass-produce TAG values that
+// collide on the SwissTable probe start and H2, making the set build and the
+// two membership loops in ModifyRecord quadratic (HashDoS) -- most of that work
+// runs under index_mutex_, which the reply path also takes. absl::Hash fully
+// mixes, so equal-fold values still share a hash while such collisions can no
+// longer be cheaply constructed.
+struct AsciiFoldedView {
+  absl::string_view value;
+
+  template <typename H>
+  friend H AbslHashValue(H h, AsciiFoldedView v) {
+    absl::string_view s = v.value;
+    char buf[64];
+    while (!s.empty()) {
+      const size_t n = std::min(s.size(), sizeof(buf));
+      for (size_t i = 0; i < n; ++i) {
+        buf[i] = static_cast<char>(
+            absl::ascii_tolower(static_cast<unsigned char>(s[i])));
+      }
+      h = H::combine_contiguous(std::move(h), buf, n);
+      s.remove_prefix(n);
     }
     return h;
+  }
+};
+struct AsciiFoldHash {
+  size_t operator()(absl::string_view s) const {
+    return absl::Hash<AsciiFoldedView>{}(AsciiFoldedView{s});
   }
 };
 struct AsciiFoldEq {

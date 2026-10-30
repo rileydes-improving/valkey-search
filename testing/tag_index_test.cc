@@ -16,6 +16,7 @@
 #include "src/indexes/index_base.h"
 #include "src/indexes/tag.h"
 #include "src/query/predicate.h"
+#include "src/utils/string_interning.h"
 #include "src/valkey_search_options.h"
 #include "testing/common.h"
 #include "vmsdk/src/testing_infra/utils.h"
@@ -236,6 +237,47 @@ TEST_F(TagIndexTest, ModifyRecordMultiValueCollisionToSingleValue) {
                                 filter_tag_string, parsed_tags);
   auto entries_fetcher = index->Search(predicate, false);
   EXPECT_THAT(Fetch(*entries_fetcher), testing::UnorderedElementsAre("key1"));
+}
+
+// A case-only update must still replace the stored raw value. KNN RETURN serves
+// the raw value through GetRawValue, so a fix that early-returns on folded-equal
+// sets without updating raw_tag_string serves stale case. (Kills the mutant that
+// skips the raw-value store on the "case-only change is no change" path.)
+TEST_F(TagIndexTest, ModifyRecordCaseOnlyChangeKeepsRawValue) {
+  EXPECT_TRUE(index->AddRecord("key1", "Red").value());
+  EXPECT_TRUE(index->ModifyRecord("key1", "red").value());
+  EXPECT_EQ(index->GetTagValueDocCount("red"), 1u);
+  auto raw = index->GetRawValue(StringInternStore::Intern("key1"));
+  ASSERT_TRUE(raw);
+  EXPECT_EQ(std::string(raw->Str()), "red");
+}
+
+// A case change combined with a real value change must deindex the removed
+// value: the folded diff's removal loop only runs when the folded sets differ,
+// so every case-insensitive test whose values fold to the same set leaves it
+// unexercised. (Kills the mutant that skips deindexing on the folded path.)
+TEST_F(TagIndexTest, ModifyRecordCaseOnlyAndValueChangeTogether) {
+  EXPECT_TRUE(index->AddRecord("key1", "Red,blue").value());
+  EXPECT_TRUE(index->ModifyRecord("key1", "red,green").value());
+  EXPECT_EQ(index->GetTagValueDocCount("red"), 1u);
+  EXPECT_EQ(index->GetTagValueDocCount("blue"), 0u);
+  EXPECT_EQ(index->GetTagValueDocCount("green"), 1u);
+  auto raw = index->GetRawValue(StringInternStore::Intern("key1"));
+  ASSERT_TRUE(raw);
+  EXPECT_EQ(std::string(raw->Str()), "red,green");
+}
+
+// A TAG value carrying bytes >= 0x80 must index and be found through the folded
+// (case-insensitive) path, and an ASCII-only case change must keep membership
+// (ASCII folding leaves high bytes untouched). Exercises the seeded fold hash on
+// non-ASCII input.
+TEST_F(TagIndexTest, FoldedMembershipHandlesHighBytes) {
+  const std::string upper = "A\xC3\x9F";  // 'A' + U+00DF, valid UTF-8, >= 0x80
+  const std::string lower = "a\xC3\x9F";
+  EXPECT_TRUE(index->AddRecord("key1", upper).value());
+  EXPECT_EQ(index->GetTagValueDocCount(upper), 1u);
+  EXPECT_TRUE(index->ModifyRecord("key1", lower).value());
+  EXPECT_EQ(index->GetTagValueDocCount(upper), 1u);
 }
 
 TEST_F(TagIndexTest, KeyTrackingTest) {
